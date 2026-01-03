@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS `player_drug_stats` (
+    `identifier` VARCHAR(60) NOT NULL,
+    `level` INT(11) DEFAULT 1,
+    `xp` INT(11) DEFAULT 0,
+    PRIMARY KEY (`identifier`)
+);
