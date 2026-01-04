@@ -86,7 +86,7 @@ AddEventHandler('drugsale:startProcess', function()
                 break
             end
 
-            -- Cancel key
+            -- Cancel key - Check BEFORE progress bar starts
             if IsControlJustPressed(0, Config.CancelKey) then
                 StopSelling("You cancelled the deal.")
                 break
@@ -137,13 +137,25 @@ AddEventHandler('drugsale:startProcess', function()
                     lib.requestAnimDict(animDict)
                     Citizen.Wait(100)
                     
+                    -- Create a watcher thread to listen for 'E' during progress bar
+                    local cancelPressed = false
+                    Citizen.CreateThread(function()
+                        while lib.progressActive() do
+                            Citizen.Wait(0)
+                            if IsControlJustPressed(0, Config.CancelKey) then
+                                cancelPressed = true
+                                lib.cancelProgress()
+                            end
+                        end
+                    end)
+                    
                     -- Progress bar
                     local success = lib.progressBar({
                         duration = duration,
                         label = ('Selling %sx %s...'):format(dealInfo.amount, dealInfo.label),
                         useWhileDead = false,
                         canCancel = true,
-                        disable = { move = true, car = true, combat = true, mouse = false },
+                        disable = { move = true, car = true, combat = true },
                         anim = { dict = animDict, clip = animName, flag = ANIM_FLAG_UPPERBODY },
                     })
 
