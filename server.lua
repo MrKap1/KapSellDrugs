@@ -1,125 +1,330 @@
+-- ====================================
+-- SERVER.LUA - Drug Selling System
+-- ====================================
+
 if not MySQL then
-    print("^1ERROR: oxmysql was not found! Make sure it is started before this script.^7")
+    print("^1[ERROR] oxmysql not found! This resource will not work.^7")
 end
 
-local playerLevels = {}
+local playerStats = {}
+local pendingTransactions = {}
 
--- Helper to get player identifier
+-- ====================================
+-- HELPER FUNCTIONS
+-- ====================================
 local function getIdentifier(source)
     return GetPlayerIdentifierByType(source, 'license')
 end
 
--- Load player data from DB
 local function loadPlayerData(source)
     local identifier = getIdentifier(source)
-    local result = MySQL.single.await('SELECT level, xp FROM player_drug_stats WHERE identifier = ?', {identifier})
+    if not identifier then return nil end
+    
+    local result = MySQL.single.await('SELECT level, xp, total_sales FROM player_drug_stats WHERE identifier = ?', {identifier})
     
     if result then
-        playerLevels[source] = { level = result.level, xp = result.xp }
+        playerStats[source] = { 
+            level = result.level, 
+            xp = result.xp,
+            totalSales = result.total_sales or 0
+        }
     else
-        MySQL.insert.await('INSERT INTO player_drug_stats (identifier, level, xp) VALUES (?, ?, ?)', {identifier, 1, 0})
-        playerLevels[source] = { level = 1, xp = 0 }
+        MySQL.insert.await('INSERT INTO player_drug_stats (identifier, level, xp, total_sales) VALUES (?, ?, ?, ?)', 
+            {identifier, 1, 0, 0})
+        playerStats[source] = { level = 1, xp = 0, totalSales = 0 }
     end
-    return playerLevels[source]
+    
+    return playerStats[source]
 end
 
--- Check Inventory Callback
-lib.callback.register('drugsale:checkInventory', function(source)
-    if not playerLevels[source] then loadPlayerData(source) end
+local function savePlayerData(source)
+    local stats = playerStats[source]
+    if not stats then return end
     
+    local identifier = getIdentifier(source)
+    if not identifier then return end
+    
+    MySQL.update.await('UPDATE player_drug_stats SET level = ?, xp = ?, total_sales = ? WHERE identifier = ?', {
+        stats.level, stats.xp, stats.totalSales, identifier
+    })
+end
+
+-- ====================================
+-- INVENTORY CHECK CALLBACK
+-- ====================================
+lib.callback.register('drugsale:checkInventory', function(source)
+    if not playerStats[source] then 
+        loadPlayerData(source) 
+    end
+    
+    -- Return the first drug the player has
     for drugName, _ in pairs(Config.Drugs) do
         local count = exports.ox_inventory:GetItemCount(source, drugName)
-        if count > 0 then return true end
+        if count > 0 then 
+            return drugName 
+        end
     end
+    
     return false
 end)
 
--- Process Transaction
-RegisterNetEvent('drugsale:processTransaction')
-AddEventHandler('drugsale:processTransaction', function(amountToSell)
-    local src = source
-    local drugToSell = nil
-    local amount = amountToSell or 1 
-
-    -- Find which drug the player has enough of
-    for drugName, _ in pairs(Config.Drugs) do
-        local itemCount = exports.ox_inventory:GetItemCount(src, drugName)
-        if itemCount >= amount then
-            drugToSell = drugName
-            break
+-- ====================================
+-- PREPARE DEAL CALLBACK
+-- ====================================
+lib.callback.register('drugsale:prepareDeal', function(source, drugName)
+    local stats = playerStats[source] or loadPlayerData(source)
+    if not stats then return nil end
+    
+    local drugConfig = Config.Drugs[drugName]
+    if not drugConfig then return nil end
+    
+    -- Generate transaction details
+    local amount = math.random(drugConfig.minAmount, drugConfig.maxAmount)
+    local basePrice = math.random(drugConfig.minPrice, drugConfig.maxPrice)
+    local bonusMultiplier = Config.LevelRewards[stats.level] or Config.MaxLevelFallback
+    local pricePerItem = math.floor(basePrice * (1 + bonusMultiplier))
+    local totalPrice = pricePerItem * amount
+    
+    -- Calculate sell duration based on level
+    local duration = Config.SellTime
+    if Config.LevelSpeedsUpSales then
+        duration = Config.SellTime - (stats.level * Config.SpeedBonusPerLevel)
+        if duration < Config.MinimumSellTime then 
+            duration = Config.MinimumSellTime 
         end
     end
+    
+    -- Create unique transaction ID
+    local transactionId = ("%s_%s"):format(source, os.time())
+    
+    -- Store transaction details
+    pendingTransactions[transactionId] = {
+        source = source,
+        drugName = drugName,
+        amount = amount,
+        totalPrice = totalPrice,
+        timestamp = os.time()
+    }
+    
+    return {
+        transactionId = transactionId,
+        amount = amount,
+        label = drugConfig.label,
+        totalPrice = totalPrice,
+        duration = duration
+    }
+end)
 
-    if drugToSell then
-        local pData = playerLevels[src] or loadPlayerData(src)
-        local drugData = Config.Drugs[drugToSell]
-
-        local currentLevel = pData.level
-        local bonusPercent = Config.LevelRewards[currentLevel] or Config.MaxLevelFallback
+-- ====================================
+-- COMPLETE TRANSACTION
+-- ====================================
+RegisterNetEvent('drugsale:completeTransaction')
+AddEventHandler('drugsale:completeTransaction', function(transactionId)
+    local src = source
+    
+    -- Validate transaction exists
+    local transaction = pendingTransactions[transactionId]
+    if not transaction then 
+        print(("^3[WARNING] Invalid transaction attempted by %s^7"):format(GetPlayerName(src)))
+        return 
+    end
+    
+    -- Validate it's the right player
+    if transaction.source ~= src then
+        print(("^1[SECURITY] Player %s tried to complete someone else's transaction!^7"):format(GetPlayerName(src)))
+        return
+    end
+    
+    -- Check transaction isn't too old (prevent replay attacks)
+    if (os.time() - transaction.timestamp) > 60 then
+        pendingTransactions[transactionId] = nil
+        TriggerClientEvent('ox_lib:notify', src, {
+            title = 'Deal Expired',
+            description = 'Transaction took too long',
+            type = 'error'
+        })
+        return
+    end
+    
+    -- Validate inventory
+    local currentCount = exports.ox_inventory:GetItemCount(src, transaction.drugName)
+    if currentCount < transaction.amount then
+        pendingTransactions[transactionId] = nil
+        TriggerClientEvent('ox_lib:notify', src, {
+            title = 'Deal Failed',
+            description = "You don't have enough items!",
+            type = 'error'
+        })
+        return
+    end
+    
+    -- Remove items
+    if not exports.ox_inventory:RemoveItem(src, transaction.drugName, transaction.amount) then
+        pendingTransactions[transactionId] = nil
+        return
+    end
+    
+    -- Add money
+    exports.ox_inventory:AddItem(src, 'money', transaction.totalPrice)
+    
+    -- Update stats
+    local stats = playerStats[src] or loadPlayerData(src)
+    stats.xp = stats.xp + Config.XPPerSale
+    stats.totalSales = stats.totalSales + 1
+    
+    -- Check for level up
+    local leveledUp = false
+    while stats.xp >= Config.XPNeeded do
+        stats.level = stats.level + 1
+        stats.xp = stats.xp - Config.XPNeeded
+        leveledUp = true
         
-        local basePrice = math.random(drugData.minPrice, drugData.maxPrice)
-        local priceWithBonus = math.floor(basePrice * (1 + bonusPercent))
-        local finalTotalPrice = priceWithBonus * amount
+        local newBonus = math.floor((Config.LevelRewards[stats.level] or Config.MaxLevelFallback) * 100)
+        TriggerClientEvent('ox_lib:notify', src, {
+            title = '🎉 Level Up!', 
+            description = ('You reached level %s!\nPrice Bonus: +%s%%'):format(stats.level, newBonus), 
+            type = 'success',
+            duration = 7000
+        })
+    end
+    
+    -- Save to database
+    savePlayerData(src)
+    
+    -- Success notification
+    local drugConfig = Config.Drugs[transaction.drugName]
+    TriggerClientEvent('ox_lib:notify', src, {
+        title = '💰 Sale Complete',
+        description = ('Sold %sx %s for $%s%s'):format(
+            transaction.amount, 
+            drugConfig.label, 
+            transaction.totalPrice,
+            leveledUp and '\n+' .. Config.XPPerSale .. ' XP' or ''
+        ),
+        type = 'success'
+    })
+    
+    -- Check for police alert
+    if Config.PoliceAlertEnabled then
+        local alertChance = Config.BasePoliceAlertChance + (stats.level * Config.AlertChancePerLevel)
+        if math.random() < alertChance then
+            -- Trigger your police system here
+            local playerCoords = GetEntityCoords(GetPlayerPed(src))
+            TriggerEvent('police:drugSaleAlert', playerCoords, src)
+            
+            TriggerClientEvent('ox_lib:notify', src, {
+                title = '🚨 Alert',
+                description = 'Someone may have seen you!',
+                type = 'warning'
+            })
+        end
+    end
+    
+    -- Clean up transaction
+    pendingTransactions[transactionId] = nil
+end)
 
-        if exports.ox_inventory:RemoveItem(src, drugToSell, amount) then
-            exports.ox_inventory:AddItem(src, 'money', finalTotalPrice)
+-- ====================================
+-- GET STATS CALLBACK
+-- ====================================
+lib.callback.register('drugsale:getStats', function(source)
+    return playerStats[source] or loadPlayerData(source)
+end)
 
-            -- FIXED: XP is now flat per transaction (1 deal = Config.XPPerSale)
-            local earnedXP = Config.XPPerSale 
-            pData.xp = pData.xp + earnedXP
-
-            -- Handle Level Up
-            while pData.xp >= Config.XPNeeded do
-                pData.level = pData.level + 1
-                pData.xp = pData.xp - Config.XPNeeded
-                TriggerClientEvent('ox_lib:notify', src, {
-                    title = 'Level Up!', 
-                    description = ('You are now level %s! Bonus: %s%%'):format(pData.level, (Config.LevelRewards[pData.level] or Config.MaxLevelFallback) * 100), 
+-- ====================================
+-- ADMIN COMMANDS
+-- ====================================
+RegisterCommand("resetdealerstats", function(source, args)
+    if source == 0 or IsPlayerAceAllowed(source, "admin") then
+        local targetId = tonumber(args[1])
+        if targetId and GetPlayerName(targetId) then
+            local identifier = getIdentifier(targetId)
+            MySQL.update.await('UPDATE player_drug_stats SET level = 1, xp = 0, total_sales = 0 WHERE identifier = ?', {identifier})
+            playerStats[targetId] = { level = 1, xp = 0, totalSales = 0 }
+            
+            if source > 0 then
+                TriggerClientEvent('ox_lib:notify', source, {
+                    description = 'Reset stats for ' .. GetPlayerName(targetId),
                     type = 'success'
                 })
             end
-
-            -- Notification for the sale
-            TriggerClientEvent('ox_lib:notify', src, {
-                title = 'Sale Complete',
-                description = ('Sold %sx %s for $%s'):format(amount, drugData.label, finalTotalPrice),
-                type = 'success'
+            
+            TriggerClientEvent('ox_lib:notify', targetId, {
+                title = 'Stats Reset',
+                description = 'Your dealer stats have been reset by an admin',
+                type = 'inform'
             })
+        else
+            if source > 0 then
+                TriggerClientEvent('ox_lib:notify', source, {
+                    description = 'Invalid player ID',
+                    type = 'error'
+                })
+            end
+        end
+    end
+end, true)
 
-            -- SAVE TO DATABASE
-            MySQL.update.await('UPDATE player_drug_stats SET level = ?, xp = ? WHERE identifier = ?', {
-                pData.level, pData.xp, getIdentifier(src)
+RegisterCommand("setdealerlevel", function(source, args)
+    if source == 0 or IsPlayerAceAllowed(source, "admin") then
+        local targetId = tonumber(args[1])
+        local newLevel = tonumber(args[2])
+        
+        if targetId and newLevel and GetPlayerName(targetId) then
+            local stats = playerStats[targetId] or loadPlayerData(targetId)
+            stats.level = newLevel
+            stats.xp = 0
+            savePlayerData(targetId)
+            
+            if source > 0 then
+                TriggerClientEvent('ox_lib:notify', source, {
+                    description = ('Set %s to level %s'):format(GetPlayerName(targetId), newLevel),
+                    type = 'success'
+                })
+            end
+            
+            TriggerClientEvent('ox_lib:notify', targetId, {
+                description = ('Your level was set to %s'):format(newLevel),
+                type = 'inform'
             })
         end
-    else
-        TriggerClientEvent('ox_lib:notify', src, {
-            title = 'Deal Failed',
-            description = 'You do not have enough items to complete this deal!',
-            type = 'error'
-        })
+    end
+end, true)
+
+-- ====================================
+-- PLAYER LOADING/CLEANUP
+-- ====================================
+AddEventHandler('playerJoining', function()
+    local src = source
+    Citizen.SetTimeout(2000, function()
+        loadPlayerData(src)
+    end)
+end)
+
+AddEventHandler('playerDropped', function()
+    local src = source
+    if playerStats[src] then
+        savePlayerData(src)
+        playerStats[src] = nil
+    end
+    
+    -- Clean up any pending transactions
+    for transactionId, transaction in pairs(pendingTransactions) do
+        if transaction.source == src then
+            pendingTransactions[transactionId] = nil
+        end
     end
 end)
 
--- Level Check Command
-RegisterCommand("druglevel", function(source)
-    local pData = playerLevels[source] or loadPlayerData(source)
-    local currentBonus = (Config.LevelRewards[pData.level] or Config.MaxLevelFallback) * 100
-    
-    TriggerClientEvent('ox_lib:notify', source, {
-        title = 'Drug Dealer Stats',
-        description = ('Level: %s | XP: %s/%s\nCurrent Bonus: %s%%'):format(
-            pData.level, pData.xp, Config.XPNeeded, currentBonus
-        ),
-        type = 'inform'
-    })
-end)
-
--- Clear RAM on leave
-AddEventHandler('playerDropped', function()
-    playerLevels[source] = nil
-end)
-
--- Stats Callback
-lib.callback.register('drugsale:getStats', function(source)
-    return playerLevels[source] or loadPlayerData(source)
+-- Periodic cleanup of old transactions (every 5 minutes)
+Citizen.CreateThread(function()
+    while true do
+        Citizen.Wait(300000) -- 5 minutes
+        local currentTime = os.time()
+        for transactionId, transaction in pairs(pendingTransactions) do
+            if (currentTime - transaction.timestamp) > 120 then
+                pendingTransactions[transactionId] = nil
+            end
+        end
+    end
 end)

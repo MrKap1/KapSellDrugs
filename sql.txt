@@ -1,6 +1,28 @@
+-- ====================================
+-- DATABASE SCHEMA - Drug Selling System
+-- ====================================
+
 CREATE TABLE IF NOT EXISTS `player_drug_stats` (
     `identifier` VARCHAR(60) NOT NULL,
     `level` INT(11) DEFAULT 1,
     `xp` INT(11) DEFAULT 0,
-    PRIMARY KEY (`identifier`)
-);
+    `total_sales` INT(11) DEFAULT 0,
+    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`identifier`),
+    INDEX `level_index` (`level`),
+    INDEX `updated_index` (`updated_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Optional: Create a leaderboard view for easy querying
+CREATE OR REPLACE VIEW `drug_dealer_leaderboard` AS
+SELECT 
+    identifier,
+    level,
+    xp,
+    total_sales,
+    updated_at,
+    RANK() OVER (ORDER BY level DESC, xp DESC) as rank_position
+FROM player_drug_stats
+ORDER BY level DESC, xp DESC
+LIMIT 100;
